@@ -1,62 +1,344 @@
 // Package twelvedata is the library behind the twelvedata command line:
-// the HTTP client, request shaping, and the typed data models for twelvedata.
+// the HTTP client, request shaping, and typed data models for the Twelve Data
+// financial market API at https://api.twelvedata.com.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The API requires an API key appended as ?apikey={key} to every request.
+// The "demo" key works for basic endpoints with limited symbols. Register a
+// free key at https://twelvedata.com/pricing for broader access.
 package twelvedata
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to twelvedata. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "twelvedata/dev (+https://github.com/tamnd/twelvedata-cli)"
+// Host is the Twelve Data API hostname.
+const Host = "api.twelvedata.com"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at twelvedata.com; change it once you
-// know the real endpoints you want to read.
-const Host = "twelvedata.com"
+// DefaultUserAgent identifies the client to the API.
+const DefaultUserAgent = "twelvedata-cli/0.1 (tamnd87@gmail.com)"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to twelvedata over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds constructor parameters for Client.
+type Config struct {
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	APIKey    string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns production defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://api.twelvedata.com",
+		APIKey:    "demo",
+		Rate:      1 * time.Second,
+		Timeout:   15 * time.Second,
+		Retries:   3,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client is the Twelve Data HTTP client.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient constructs a Client from cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// --- Public output types ---
+
+// Price is a real-time price record for a symbol.
+type Price struct {
+	Symbol string `kit:"id" json:"symbol"`
+	Price  string `json:"price"`
+}
+
+// Quote is a full daily quote with OHLCV and 52-week range.
+type Quote struct {
+	Symbol        string `kit:"id" json:"symbol"`
+	Name          string `json:"name"`
+	Exchange      string `json:"exchange"`
+	Date          string `json:"date"`
+	Open          string `json:"open"`
+	High          string `json:"high"`
+	Low           string `json:"low"`
+	Close         string `json:"close"`
+	Volume        string `json:"volume"`
+	Change        string `json:"change"`
+	ChangePercent string `json:"change_percent"`
+	Week52Low     string `json:"week52_low"`
+	Week52High    string `json:"week52_high"`
+}
+
+// Bar is one OHLCV candle in a time series.
+type Bar struct {
+	Datetime string `kit:"id" json:"datetime"`
+	Open     string `json:"open"`
+	High     string `json:"high"`
+	Low      string `json:"low"`
+	Close    string `json:"close"`
+	Volume   string `json:"volume"`
+}
+
+// Stock is an available stock listing.
+type Stock struct {
+	Symbol   string `kit:"id" json:"symbol"`
+	Name     string `json:"name"`
+	Exchange string `json:"exchange"`
+	Country  string `json:"country"`
+	Currency string `json:"currency"`
+	Type     string `json:"type"`
+}
+
+// Exchange is a market exchange.
+type Exchange struct {
+	Code     string `kit:"id" json:"code"`
+	Name     string `json:"name"`
+	Title    string `json:"title"`
+	Country  string `json:"country"`
+	Timezone string `json:"timezone"`
+}
+
+// --- Wire types (API JSON shapes) ---
+
+type wireQuote struct {
+	Symbol        string `json:"symbol"`
+	Name          string `json:"name"`
+	Exchange      string `json:"exchange"`
+	Datetime      string `json:"datetime"`
+	Open          string `json:"open"`
+	High          string `json:"high"`
+	Low           string `json:"low"`
+	Close         string `json:"close"`
+	Volume        string `json:"volume"`
+	Change        string `json:"change"`
+	PercentChange string `json:"percent_change"`
+	FiftyTwoWeek  struct {
+		Low  string `json:"low"`
+		High string `json:"high"`
+	} `json:"fifty_two_week"`
+}
+
+type wireTimeSeries struct {
+	Meta struct {
+		Symbol   string `json:"symbol"`
+		Interval string `json:"interval"`
+	} `json:"meta"`
+	Values []struct {
+		Datetime string `json:"datetime"`
+		Open     string `json:"open"`
+		High     string `json:"high"`
+		Low      string `json:"low"`
+		Close    string `json:"close"`
+		Volume   string `json:"volume"`
+	} `json:"values"`
+}
+
+type wireStocks struct {
+	Data []struct {
+		Symbol   string `json:"symbol"`
+		Name     string `json:"name"`
+		Currency string `json:"currency"`
+		Exchange string `json:"exchange"`
+		Country  string `json:"country"`
+		Type     string `json:"type"`
+	} `json:"data"`
+	Count  int    `json:"count"`
+	Status string `json:"status"`
+}
+
+type wireExchanges struct {
+	Data []struct {
+		Title    string `json:"title"`
+		Name     string `json:"name"`
+		Code     string `json:"code"`
+		Country  string `json:"country"`
+		Timezone string `json:"timezone"`
+	} `json:"data"`
+	Status string `json:"status"`
+}
+
+// --- Client methods ---
+
+// GetPrice fetches a real-time price for the given symbol.
+func (c *Client) GetPrice(ctx context.Context, symbol string) (*Price, error) {
+	u := c.buildURL("/price", "symbol", symbol)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var w struct {
+		Price string `json:"price"`
+	}
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil, fmt.Errorf("price decode: %w", err)
+	}
+	if w.Price == "" {
+		return nil, fmt.Errorf("no price returned for symbol %q", symbol)
+	}
+	return &Price{Symbol: symbol, Price: w.Price}, nil
+}
+
+// GetQuote fetches a full quote (OHLCV + 52-week range) for the given symbol.
+func (c *Client) GetQuote(ctx context.Context, symbol string) (*Quote, error) {
+	u := c.buildURL("/quote", "symbol", symbol)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var w wireQuote
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil, fmt.Errorf("quote decode: %w", err)
+	}
+	if w.Symbol == "" {
+		return nil, fmt.Errorf("no quote returned for symbol %q", symbol)
+	}
+	return &Quote{
+		Symbol:        w.Symbol,
+		Name:          w.Name,
+		Exchange:      w.Exchange,
+		Date:          w.Datetime,
+		Open:          w.Open,
+		High:          w.High,
+		Low:           w.Low,
+		Close:         w.Close,
+		Volume:        w.Volume,
+		Change:        w.Change,
+		ChangePercent: w.PercentChange,
+		Week52Low:     w.FiftyTwoWeek.Low,
+		Week52High:    w.FiftyTwoWeek.High,
+	}, nil
+}
+
+// GetTimeSeries fetches OHLCV bars for the given symbol, interval, and count.
+// interval is one of: 1min, 5min, 15min, 30min, 1h, 4h, 1day, 1week, 1month.
+func (c *Client) GetTimeSeries(ctx context.Context, symbol, interval string, count int) ([]Bar, error) {
+	countStr := fmt.Sprintf("%d", count)
+	u := c.buildURL("/time_series", "symbol", symbol, "interval", interval, "outputsize", countStr)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var w wireTimeSeries
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil, fmt.Errorf("time_series decode: %w", err)
+	}
+	bars := make([]Bar, len(w.Values))
+	for i, v := range w.Values {
+		bars[i] = Bar{
+			Datetime: v.Datetime,
+			Open:     v.Open,
+			High:     v.High,
+			Low:      v.Low,
+			Close:    v.Close,
+			Volume:   v.Volume,
+		}
+	}
+	return bars, nil
+}
+
+// ListStocks returns available stock symbols, optionally filtered by exchange and country.
+// limit caps the results client-side.
+func (c *Client) ListStocks(ctx context.Context, exchange, country string, limit int) ([]Stock, error) {
+	params := []string{}
+	if exchange != "" {
+		params = append(params, "exchange", exchange)
+	}
+	if country != "" {
+		params = append(params, "country", country)
+	}
+	u := c.buildURL("/stocks", params...)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var w wireStocks
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil, fmt.Errorf("stocks decode: %w", err)
+	}
+	data := w.Data
+	if limit > 0 && len(data) > limit {
+		data = data[:limit]
+	}
+	out := make([]Stock, len(data))
+	for i, s := range data {
+		out[i] = Stock{
+			Symbol:   s.Symbol,
+			Name:     s.Name,
+			Exchange: s.Exchange,
+			Country:  s.Country,
+			Currency: s.Currency,
+			Type:     s.Type,
+		}
+	}
+	return out, nil
+}
+
+// ListExchanges returns all available market exchanges.
+func (c *Client) ListExchanges(ctx context.Context) ([]Exchange, error) {
+	u := c.buildURL("/exchanges")
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var w wireExchanges
+	if err := json.Unmarshal(body, &w); err != nil {
+		return nil, fmt.Errorf("exchanges decode: %w", err)
+	}
+	out := make([]Exchange, len(w.Data))
+	for i, e := range w.Data {
+		out[i] = Exchange{
+			Code:     e.Code,
+			Name:     e.Name,
+			Title:    e.Title,
+			Country:  e.Country,
+			Timezone: e.Timezone,
+		}
+	}
+	return out, nil
+}
+
+// buildURL assembles a full API URL with the apikey parameter and optional
+// additional key=value pairs. Pairs with empty values are skipped.
+func (c *Client) buildURL(path string, params ...string) string {
+	apiKey := c.cfg.APIKey
+	if apiKey == "" {
+		apiKey = "demo"
+	}
+	base := c.cfg.BaseURL
+	if base == "" {
+		base = "https://api.twelvedata.com"
+	}
+	u := base + path + "?apikey=" + url.QueryEscape(apiKey)
+	for i := 0; i+1 < len(params); i += 2 {
+		if params[i+1] != "" {
+			u += "&" + params[i] + "=" + url.QueryEscape(params[i+1])
+		}
+	}
+	return u
+}
+
+// get fetches a URL with pacing and retries. The body is fully read and closed.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +346,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +355,22 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	ua := c.cfg.UserAgent
+	if ua == "" {
+		ua = DefaultUserAgent
+	}
+	req.Header.Set("User-Agent", ua)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -106,10 +392,12 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 
 // pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate <= 0 {
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -121,80 +409,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on twelvedata.com. It is a stand-in for the typed records you
-// will model from the real twelvedata endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `twelvedata cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
